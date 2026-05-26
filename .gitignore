@@ -1,0 +1,13 @@
+node_modules/
+auth_baileys/
+.env
+tg_chatid.json
+sudo.json
+warns.json
+badwords.json
+rules.json
+blackhole.json
+timecapsules.json
+nightmode.json
+temp/
+*.log
