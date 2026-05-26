@@ -1,4 +1,3 @@
-require('./setting/config');
 const fs = require('fs');
 const path = require('path');
 const { Telegraf, Markup } = require('telegraf');
@@ -6,8 +5,21 @@ const { message, callbackQuery } = require('telegraf/filters');
 const yts = require('yt-search');
 const { ytdl } = require('./allfunc/scrape-ytdl');
 const startpairing = require('./pair');
-const { BOT_TOKEN } = require('./token');
 const { jidNormalizedUser, makeWASocket, useMultiFileAuthState } = require("@whiskeysockets/baileys");
+
+// ========== CONFIGURATION ==========
+// Essaye de charger le token depuis token.js, sinon utilise variable d'environnement
+let BOT_TOKEN;
+try {
+  const tokenModule = require('./token');
+  BOT_TOKEN = tokenModule.BOT_TOKEN;
+} catch (e) {
+  BOT_TOKEN = process.env.BOT_TOKEN;
+}
+if (!BOT_TOKEN) {
+  console.error("❌ BOT_TOKEN manquant. Crée un fichier token.js ou set env BOT_TOKEN");
+  process.exit(1);
+}
 
 const adminFilePath = './database/admintele.json';
 const bannedPath = './richstore/pairing/banned.json';
@@ -31,6 +43,9 @@ try {
 const userStates = {};
 
 function trackUser(id) {
+  if (!fs.existsSync(userStore)) {
+    fs.writeFileSync(userStore, JSON.stringify([]));
+  }
   const users = JSON.parse(fs.readFileSync(userStore));
   if (!users.includes(id)) {
     users.push(id);
@@ -109,6 +124,7 @@ function sendDelPairPage(ctx, userID, pageIndex) {
   });
 }
 
+// ========== COMMANDES TELEGRAM ==========
 bot.command('ping', async (ctx) => {
   const uptime = Math.floor((Date.now() - botStartTime) / 1000);
   ctx.reply(` 𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 \n*ᴘɪɴɢ*\nʀᴜɴᴛɪᴍᴇ: *${formatRuntime(uptime)}*`, {
@@ -388,8 +404,47 @@ bot.on('text', async (ctx) => {
   }
 });
 
-bot.launch()
-  .then(() => console.log('The bot is running successfully'))
-  .catch(err => console.error('Error while running bot:', err));
+// ========== FONCTIONS EXPORTÉES POUR index.js ==========
+let pairingResolve = null;
 
-module.exports = bot;
+function initTelegramBot() {
+  console.log("🤖 Initialisation du bot Telegram...");
+  bot.launch()
+    .then(() => console.log('✅ Bot Telegram actif'))
+    .catch(err => console.error('❌ Erreur lancement Telegram:', err));
+}
+
+function waitForPhoneNumber() {
+  return new Promise((resolve) => {
+    pairingResolve = resolve;
+    console.log("📱 En attente d'un numéro via Telegram...");
+  });
+}
+
+function sendPairingCode(code) {
+  if (!pairingResolve) return;
+  // On envoie le code à l'utilisateur qui a demandé le pairing
+  // Ici on pourrait l'envoyer à un chat spécifique. On utilise simplement la résolution.
+  console.log(`🔑 Code de pairing reçu: ${code}`);
+  // On pourrait aussi l'envoyer sur Telegram à l'admin
+  pairingResolve(code);
+  pairingResolve = null;
+}
+
+function notifyConnected(jid) {
+  console.log(`🔌 Bot WhatsApp connecté: ${jid}`);
+  // Optionnel : envoyer un message sur Telegram
+}
+
+function notifyDisconnected(reason) {
+  console.log(`⚠️ Bot WhatsApp déconnecté: ${reason}`);
+}
+
+module.exports = {
+  initTelegramBot,
+  waitForPhoneNumber,
+  sendPairingCode,
+  notifyConnected,
+  notifyDisconnected,
+  bot // si jamais tu veux l'utiliser ailleurs
+};
