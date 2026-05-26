@@ -1,233 +1,395 @@
-import TelegramBot from "node-telegram-bot-api";
-import dotenv from "dotenv";
-import fs from "fs";
-dotenv.config();
+require('./setting/config');
+const fs = require('fs');
+const path = require('path');
+const { Telegraf, Markup } = require('telegraf');
+const { message, callbackQuery } = require('telegraf/filters');
+const yts = require('yt-search');
+const { ytdl } = require('./allfunc/scrape-ytdl');
+const startpairing = require('./pair');
+const { BOT_TOKEN } = require('./token');
+const { jidNormalizedUser, makeWASocket, useMultiFileAuthState } = require("@whiskeysockets/baileys");
 
-const CHAT_ID_FILE = "./tg_chatid.json";
+const adminFilePath = './database/admintele.json';
+const bannedPath = './richstore/pairing/banned.json';
+const ITEMS_PER_PAGE = 10;
+const pagedListPairs = {};
+const botStartTime = Date.now();
+const userStore = './richstore/pairing/users.json';
+const premium_file = './premium.json';
+let premiumUsers = [];
 
-const log = {
-  info:  (...a) => console.log("[TG INFO]",  ...a),
-  warn:  (...a) => console.log("[TG WARN]",  ...a),
-  error: (...a) => console.log("[TG ERROR]", ...a),
-};
+try {
+  if (fs.existsSync(premium_file)) {
+    premiumUsers = JSON.parse(fs.readFileSync(premium_file, 'utf-8'));
+  } else {
+    fs.writeFileSync(premium_file, JSON.stringify([]));
+  }
+} catch (error) {
+  console.error('Failed to load premium users:', error);
+}
 
-let bot = null;
-let pairingResolver = null;
-let pendingChatId = loadChatId();
+const userStates = {};
 
-function loadChatId() {
+function trackUser(id) {
+  const users = JSON.parse(fs.readFileSync(userStore));
+  if (!users.includes(id)) {
+    users.push(id);
+    fs.writeFileSync(userStore, JSON.stringify(users, null, 2));
+  }
+}
+
+if (!fs.existsSync(adminFilePath)) {
+  const defaultAdmin = [String(process.env.OWNER_ID || '8725904884')];
+  fs.writeFileSync(adminFilePath, JSON.stringify(defaultAdmin, null, 2));
+}
+
+const adminIDs = JSON.parse(fs.readFileSync(adminFilePath, 'utf8'));
+const bot = new Telegraf(BOT_TOKEN);
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getPushName(ctx) {
+  return ctx.from.first_name || ctx.from.username || "User";
+}
+
+function formatRuntime(seconds) {
+  const pad = (s) => (s < 10 ? '0' + s : s);
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${pad(hrs)}h ${pad(mins)}m ${pad(secs)}s`;
+}
+
+function sendListPairPage(ctx, userID, pageIndex) {
+  const pairedDevices = pagedListPairs[userID] || [];
+  const totalPages = Math.max(1, Math.ceil(pairedDevices.length / ITEMS_PER_PAGE));
+  pageIndex = Math.min(Math.max(pageIndex, 0), totalPages - 1);
+  const start = pageIndex * ITEMS_PER_PAGE;
+  const currentPage = pairedDevices.slice(start, start + ITEMS_PER_PAGE);
+  const pageText = currentPage.length
+    ? currentPage.map((id, i) => `𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣\n\n*${start + i + 1}.* \`ID:\` ${id}`).join('\n⎔')
+    : "_No paired devices found._";
+  const navButtons = [];
+  if (pageIndex > 0) navButtons.push({ text: '⬅️ Back', callback_data: `listpair_page_${pageIndex - 1}` });
+  if (pageIndex < totalPages - 1) navButtons.push({ text: '➡️ Next', callback_data: `listpair_page_${pageIndex + 1}` });
+  const text = `𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣\n\n*Paired Bots (Page ${pageIndex + 1}/${totalPages}):*\n\n⎔${pageText}`;
+  ctx.editMessageText(text, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: navButtons.length ? [navButtons] : [] }
+  }).catch(() => {
+    ctx.reply(text, {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: navButtons.length ? [navButtons] : [] }
+    });
+  });
+}
+
+function sendDelPairPage(ctx, userID, pageIndex) {
+  const pairedDevices = pagedListPairs[userID] || [];
+  const totalPages = Math.max(1, Math.ceil(pairedDevices.length / ITEMS_PER_PAGE));
+  pageIndex = Math.min(Math.max(pageIndex, 0), totalPages - 1);
+  const start = pageIndex * ITEMS_PER_PAGE;
+  const currentPage = pairedDevices.slice(start, start + ITEMS_PER_PAGE);
+  const keyboard = currentPage.map(id => [
+    { text: `🗑️ ${id}`, callback_data: `delpair_${id}` }
+  ]);
+  const navButtons = [];
+  if (pageIndex > 0) navButtons.push({ text: '⬅️ Back', callback_data: `delpair_page_${pageIndex - 1}` });
+  if (pageIndex < totalPages - 1) navButtons.push({ text: '➡️ Next', callback_data: `delpair_page_${pageIndex + 1}` });
+  if (navButtons.length) keyboard.push(navButtons);
+  const text = pairedDevices.length
+    ? `Delete Paired Devices (Page ${pageIndex + 1}/${totalPages}):\n\nTap a device ID to delete.`
+    : "_No paired devices found._";
+  ctx.deleteMessage().catch(() => {});
+  ctx.reply(text, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: keyboard }
+  });
+}
+
+bot.command('ping', async (ctx) => {
+  const uptime = Math.floor((Date.now() - botStartTime) / 1000);
+  ctx.reply(` 𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 \n*ᴘɪɴɢ*\nʀᴜɴᴛɪᴍᴇ: *${formatRuntime(uptime)}*`, {
+    parse_mode: 'Markdown'
+  });
+});
+
+bot.start((ctx) => {
+  const userId = ctx.from.id;
+  trackUser(userId);
+  ctx.reply('𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣\n\nɪs ᴀᴄᴛɪᴠᴇ ᴀɴᴅ ʀᴜɴɴɪɴɢ ᴡᴇʟʟ🟢', {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '𝗦𝗧𝗔𝗥𝗧 𝗕𝗢𝗧', callback_data: 'start_bot' }]
+      ]
+    }
+  });
+});
+
+bot.action('start_bot', async (ctx) => {
+  const pushname = getPushName(ctx);
+  const photoUrl = 'https://gangalink.vercel.app/i/nfp41v55.jpg';
+  const captionText = `  
+╭━━━━ ⌜𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣⌟
+┃❍╭━━━━━━━━━━━━━━━━≽ 👤 ᴜsᴇʀ : ${pushname}
+┃❍│👑 ᴅᴇᴠ  : @Varnox_Or_novark 
+┃❍│🤖 ʙᴏᴛ ɴᴀᴍᴇ : 𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣
+┃❍│⚡ᴠᴇʀsɪᴏɴ : 𝟏.𝟎 
+┃❍│♻️ sᴛᴀᴛᴜs :
+┗━━━
+┏━━━━⪨⌜BOT INFO⌟⪩━━▣
+┃✪┃ /connect
+┃✪┃ /delpair
+┃✪┃ /xreport
+┃✪┃ /deluser
+┃✪┃ /listpair
+┃✪┃ /broadcast
+╰━━━━━━━━━━━━━━━━≽
+ ©2026 ɳσʋαɾƙ xᴅ ʋ1 Ⴆყ ʋαɾɳσx
+`;
+  const buttons = Markup.inlineKeyboard([
+    [Markup.button.url('👤 ɢʀᴏᴜᴘ', 'https://t.me/varnox_official'), Markup.button.url('🔔 ᴄʜᴀɴɴᴇʟ', 'https://t.me/varnoxprimeech')]
+  ]);
   try {
-    if (fs.existsSync(CHAT_ID_FILE)) {
-      const data = JSON.parse(fs.readFileSync(CHAT_ID_FILE, "utf-8"));
-      return data.chatId || null;
-    }
-  } catch {}
-  return null;
-}
-
-function saveChatId(chatId) {
-  try { fs.writeFileSync(CHAT_ID_FILE, JSON.stringify({ chatId })); } catch {}
-}
-
-const ALLOWED_CHAT_IDS = process.env.TELEGRAM_ALLOWED_IDS
-  ? process.env.TELEGRAM_ALLOWED_IDS.split(",").map((s) => s.trim())
-  : [];
-
-function isAllowed(chatId) {
-  if (ALLOWED_CHAT_IDS.length === 0) return true;
-  return ALLOWED_CHAT_IDS.includes(String(chatId));
-}
-
-export function initTelegramBot() {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token) {
-    log.error("TELEGRAM_BOT_TOKEN manquant — le pairing Telegram est désactivé.");
-    return null;
+    await ctx.sendChatAction('upload_photo');
+    await ctx.replyWithPhoto(photoUrl, { caption: captionText, parse_mode: 'HTML', ...buttons });
+  } catch (err) {
+    console.error('Image failed to load, sending fallback text:', err);
+    await ctx.reply(captionText, { parse_mode: 'HTML', ...buttons });
   }
+});
 
-  bot = new TelegramBot(token, { polling: true });
-  log.info("Bot Telegram démarré et en écoute...");
-
-  bot.on("polling_error", (err) => {
-    log.error("Erreur polling Telegram: " + (err?.message ?? err));
-  });
-
-  bot.onText(/\/start/, (msg) => {
-    const chatId = msg.chat.id;
-    if (!isAllowed(chatId)) {
-      bot.sendMessage(chatId, "⛔ Accès refusé.");
-      return;
-    }
-    pendingChatId = chatId;
-    saveChatId(chatId);
-    bot.sendMessage(
-      chatId,
-      `╔═══════════════════════════════════╗\n` +
-      `║  🤖  𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 — Pairing Bot   ║\n` +
-      `╚═══════════════════════════════════╝\n\n` +
-      `Bienvenue ! Pour lier ton WhatsApp :\n\n` +
-      `📱 Envoie ton numéro WhatsApp avec la commande :\n` +
-      `*/pair 224XXXXXXXXX*\n\n` +
-      `_Format international sans + (ex: 224669288332)_`,
-      { parse_mode: "Markdown" }
-    );
-  });
-
-  bot.onText(/\/pair(?:\s+(\d+))?/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    if (!isAllowed(chatId)) {
-      bot.sendMessage(chatId, "⛔ Accès refusé.");
-      return;
-    }
-
-    pendingChatId = chatId;
-    saveChatId(chatId);
-
-    const number = match?.[1];
-    if (!number || number.length < 7) {
-      bot.sendMessage(
-        chatId,
-        "❌ Numéro invalide.\n\nUtilise : `/pair 224XXXXXXXXX`",
-        { parse_mode: "Markdown" }
-      );
-      return;
-    }
-
-    if (!pairingResolver) {
-      bot.sendMessage(
-        chatId,
-        "⏳ Le bot WhatsApp n'est pas encore prêt.\n\n_Attends quelques secondes et réessaie avec_ `/pair " + number + "`",
-        { parse_mode: "Markdown" }
-      );
-      return;
-    }
-
-    bot.sendMessage(
-      chatId,
-      `⏳ Génération du code pour *${number}*...\n_Patiente quelques secondes_`,
-      { parse_mode: "Markdown" }
-    );
-
-    pairingResolver(number);
-    pairingResolver = null;
-  });
-
-  bot.onText(/\/status/, (msg) => {
-    const chatId = msg.chat.id;
-    if (!isAllowed(chatId)) return;
-    const uptime = process.uptime();
-    const h = Math.floor(uptime / 3600);
-    const m = Math.floor((uptime % 3600) / 60);
-    const s = Math.floor(uptime % 60);
-    bot.sendMessage(
-      chatId,
-      `✅ Bot actif depuis *${h}h ${m}m ${s}s*`,
-      { parse_mode: "Markdown" }
-    );
-  });
-
-  bot.onText(/\/help/, (msg) => {
-    const chatId = msg.chat.id;
-    if (!isAllowed(chatId)) return;
-    bot.sendMessage(
-      chatId,
-      `📋 *Commandes disponibles :*\n\n` +
-      `/start — Message d'accueil\n` +
-      `/pair 224XXXXXXXXX — Lier WhatsApp\n` +
-      `/status — Statut du bot\n` +
-      `/help — Ce message`,
-      { parse_mode: "Markdown" }
-    );
-  });
-
-  return bot;
-}
-
-export function waitForPhoneNumber() {
-  return new Promise((resolve) => {
-    if (!bot) {
-      log.warn("Telegram bot non initialisé — en attente de NUMBER dans .env");
-      const envNumber = process.env.NUMBER;
-      if (envNumber) {
-        log.info("Utilisation du numéro depuis .env: " + envNumber);
-        resolve(envNumber.replace(/[^0-9]/g, ""));
-      } else {
-        log.error("Aucun numéro disponible. Configure NUMBER dans .env ou utilise Telegram.");
-        resolve(null);
+bot.command('connect', async (ctx) => {
+  const userId = ctx.from.id;
+  const channelUsernames = ['@varnox_official','@varnoxprimeech','@devhive_canalchat','@novarkxdch'];
+  let joinedAllChannels = true;
+  for (const channel of channelUsernames) {
+    try {
+      const member = await ctx.telegram.getChatMember(channel, userId);
+      if (['left', 'kicked'].includes(member.status)) {
+        joinedAllChannels = false;
+        break;
       }
-      return;
+    } catch (e) {
+      joinedAllChannels = false;
+      break;
     }
-
-    log.info("En attente d'un numéro via Telegram...");
-
-    // Notify saved chat if available
-    if (pendingChatId) {
-      try {
-        bot.sendMessage(
-          pendingChatId,
-          `🔄 *Re-pairing nécessaire*\n\n` +
-          `La session WhatsApp a expiré. Envoie :\n\n` +
-          `*/pair 224XXXXXXXXX*\n\n` +
-          `_Remplace par ton numéro WhatsApp_`,
-          { parse_mode: "Markdown" }
-        );
-      } catch {}
-    }
-
-    pairingResolver = resolve;
-  });
-}
-
-export function sendPairingCode(code) {
-  const codeStr = String(code);
-  if (!bot || !pendingChatId) {
-    log.warn("Impossible d'envoyer le code Telegram: bot ou chatId manquant");
-    console.log("\n╔══════════════════════════════════════════════╗");
-    console.log("║   🔑  CODE DE LIAISON WHATSAPP               ║");
-    console.log("║                                              ║");
-    console.log("║     >>>  " + codeStr.padEnd(20) + "  <<<  ║");
-    console.log("║                                              ║");
-    console.log("╚══════════════════════════════════════════════╝\n");
-    return;
   }
-  bot.sendMessage(
-    pendingChatId,
-    `╔═══════════════════════════════════╗\n` +
-    `║   🔑  CODE DE LIAISON WHATSAPP    ║\n` +
-    `╚═══════════════════════════════════╝\n\n` +
-    `🔢 Ton code :\n\n` +
-    `*${codeStr}*\n\n` +
-    `📱 *Instructions :*\n` +
-    `1. Ouvre WhatsApp\n` +
-    `2. ⋮ Menu → Appareils liés\n` +
-    `3. Lier un appareil → Entrer le code\n\n` +
-    `⏰ _Le code expire dans 2 minutes_`,
-    { parse_mode: "Markdown" }
+  if (!joinedAllChannels) {
+    return ctx.reply(
+      `𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 \n\nᴅᴏ ᴛʜᴇ ғᴏʟʟᴏᴡɪɴɢ\nᴊᴏɪɴ ᴀʟʟ ᴘʀᴏᴘᴏsᴀʟ\n ɪғ ᴅᴏɴᴇ ᴘʀᴇss "ᴊᴏɪɴᴇᴅ"\n👑𝙳𝙴𝚅: @Varnox_Or_novark`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '📢ᴄʜᴀɴɴᴇʟ', url: 'https://t.me/varnox_official'}],
+            [{ text: '👤ɢʀᴏᴜᴘ', url: 'https://t.me/varnox_Gc'}],
+            [{ text: '📢ᴄʜᴀɴɴᴇʟ', url: 'https://t.me/varnoxprimeech'}],
+            [{ text: '📢ᴄʜᴀɴɴᴇʟ', url: 'https://t.me/novarkxdch' }],
+            [{ text: '📢ᴄʜᴀɴɴᴇʟ', url: 'https://t.me/devhive_canalchat'}],
+            [{ text: '𝗖𝗛𝗘𝗖𝗞 𝗝𝗢𝗜𝗡', callback_data: 'check_join' }]
+          ]
+        }
+      }
+    );
+  }
+  const text = ctx.message.text.split(' ')[1];
+  if (!text) {
+    return ctx.reply('𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 \n\n ʜᴏᴡ ᴛᴏ ᴄᴏɴɴᴇᴄᴛ\n ᴇɴᴛᴇʀ ʏᴏᴜʀ ɴᴜᴍ ᴜsɪɴɢ ᴛʜᴇ ғᴏʀᴍᴀᴛ ʙᴇʟᴏᴡ\n ᴇxᴀᴍᴘʟᴇ: /connect 224xxxxx', { parse_mode: 'Markdown' });
+  }
+  if (/[a-z]/i.test(text)) {
+    return ctx.reply('Please enter a valid phone number.');
+  }
+  if (!/^\d{7,15}(\|\d{1,10})?$/.test(text)) {
+    return ctx.reply('Enter number in this format: 224xxxx(numbers only, no symbols or letters❌)', { parse_mode: 'Markdown' });
+  }
+  if (text.startsWith('0')) {
+    return ctx.reply('Please use a different number format.');
+  }
+  const target = text.split("|")[0];
+  const Xreturn = target.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+  const countryCode = text.slice(0, 3);
+  const prefixxx = text.slice(0, 1);
+  if (["252", "229", "92", "0"].includes(countryCode) || prefixxx === "0") {
+    return ctx.reply("🚫Sorry, numbers with this country code are not supported.");
+  }
+  const pairingFolder = './richstore/pairing';
+  const pairedUsersFromJson = fs.readdirSync(pairingFolder).filter(file => file.endsWith('@s.whatsapp.net')).length;
+  if (pairedUsersFromJson >= 70) {
+    return ctx.reply(`*Pairing not more available contact owner to create another server*`);
+  }
+  await startpairing(Xreturn);
+  await sleep(4000);
+  const cu = fs.readFileSync('./richstore/pairing/pairing.json', 'utf-8');
+  const cuObj = JSON.parse(cu);
+  ctx.reply(
+    ` 
+╭━━━ ⌜𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣⌟ 
+┃❍╭━━━━━━━━━━━━━≽
+┃ ➥ ʏᴏᴜʀ ᴘᴀɪʀɪɴɢ 
+┃❍│ᴘᴀɪʀ ɴᴜᴍ: \`${target}\`
+┃❍│ᴘᴀɪʀ ᴄᴏᴅᴇ: \`${cuObj.code}\`
+╰━━━━━━━━━━━━━━━━≽
+ ©2026 ɳσʋαɾƙ xᴅ ʋ1 Ⴆყ ʋαɾɳσx
+`,
+    {
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🔔ᴄʜᴀɴɴᴇʟ', url: 'https://t.me/varnox_official'}]
+        ]
+      }
+    }
   );
-  log.info("Code de pairing envoyé via Telegram au chat " + pendingChatId);
-}
+});
 
-export function notifyConnected(phoneNumber) {
-  if (!bot || !pendingChatId) return;
-  bot.sendMessage(
-    pendingChatId,
-    `✅ *WhatsApp connecté avec succès !*\n\n` +
-    `📱 Numéro lié : *${phoneNumber}*\n` +
-    `🤖 Le bot est maintenant actif.\n\n` +
-    `> 𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 V2 — En ligne`,
-    { parse_mode: "Markdown" }
-  );
-}
+bot.action('check_join', async (ctx) => {
+  const channelUsernames = ['@varnox_official','@varnoxprimeech','@novarkxdch','@devhive_canalchat'];
+  const userId = ctx.from.id;
+  let joinedAllChannels = true;
+  for (const channel of channelUsernames) {
+    try {
+      const member = await ctx.telegram.getChatMember(channel, userId);
+      if (['left', 'kicked'].includes(member.status)) {
+        joinedAllChannels = false;
+        break;
+      }
+    } catch (e) {
+      joinedAllChannels = false;
+      break;
+    }
+  }
+  if (joinedAllChannels) {
+    ctx.reply('You have successfully joined all requests.');
+  } else {
+    ctx.answerCbQuery('You haven’t joined yet pls do.', { show_alert: true });
+  }
+});
 
-export function notifyDisconnected(reason) {
-  if (!bot || !pendingChatId) return;
-  bot.sendMessage(
-    pendingChatId,
-    `❌ *Bot WhatsApp déconnecté*\n\nRaison : ${reason}\n\n_Reconnexion automatique en cours..._`,
-    { parse_mode: "Markdown" }
-  );
-}
+bot.command('listpair', async (ctx) => {
+  const userID = ctx.from.id.toString();
+  if (!adminIDs.includes(userID)) return ctx.reply('Unauthorized access.🚫');
+  const pairingPath = './richstore/pairing';
+  if (!fs.existsSync(pairingPath)) return ctx.reply('No paired devices found.');
+  const entries = fs.readdirSync(pairingPath, { withFileTypes: true });
+  const pairedDevices = entries.filter(entry => entry.isDirectory()).map(entry => entry.name);
+  if (pairedDevices.length === 0) return ctx.reply('No paired devices found.');
+  pagedListPairs[userID] = pairedDevices;
+  sendListPairPage(ctx, userID, 0);
+});
 
-export function getTelegramBot() {
-  return bot;
-}
+bot.command('deluser', async (ctx) => {
+  const userID = ctx.from.id.toString();
+  if (!adminIDs.includes(userID)) return ctx.reply('Unauthorized access🚫.');
+  const pairingPath = './richstore/pairing';
+  if (!fs.existsSync(pairingPath)) return ctx.reply('No paired devices found.');
+  const entries = fs.readdirSync(pairingPath, { withFileTypes: true });
+  const pairedDevices = entries.filter(entry => entry.isDirectory()).map(entry => entry.name);
+  if (pairedDevices.length === 0) return ctx.reply('No paired devices found.');
+  pagedListPairs[userID] = pairedDevices;
+  sendDelPairPage(ctx, userID, 0);
+});
+
+bot.command('broadcast', async (ctx) => {
+  const senderId = ctx.from.id;
+  const message = ctx.message.text.split(' ').slice(1).join(' ');
+  if (!adminIDs.includes(senderId.toString())) {
+    return ctx.reply('access blocked only my owner ʋαɾɳσx can use this command🚫.');
+  }
+  if (!message) {
+    return ctx.reply('𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 \n\n Please provide a message to broadcast.\n Usage: /broadcast Hello users!');
+  }
+  const users = JSON.parse(fs.readFileSync('./richstore/pairing/users.json'));
+  let success = 0, failed = 0;
+  for (const userId of users) {
+    try {
+      await ctx.telegram.sendMessage(userId, `𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 \n\nᴍsɢ:${message}`, { parse_mode: 'Markdown' });
+      success++;
+    } catch { failed++; }
+  }
+  ctx.reply(`Broadcast complete.\n\nSuccess: ${success}\nFailed: ${failed}`);
+});
+
+bot.command('xreport', async (ctx) => {
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length === 0) return ctx.reply('𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 \n\n Usage: /xreport 224xxxx');
+  const targetNumber = args[0].replace(/\D/g, '');
+  if (!targetNumber) return ctx.reply('Invalid number. Use digits only.');
+  const targetJid = jidNormalizedUser(`${targetNumber}@s.whatsapp.net`);
+  const pairingPath = './richstore/pairing';
+  if (!fs.existsSync(pairingPath)) return ctx.reply('No active paired devices found.');
+  const sessions = fs.readdirSync(pairingPath, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .map(entry => path.join(pairingPath, entry.name));
+  if (sessions.length === 0) return ctx.reply('No active WhatsApp sessions to perform report.');
+  ctx.reply(`𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 \n\n 🚨 Starting *mass-report* on +${targetNumber} using ${sessions.length} paired bots...`, { parse_mode: 'Markdown' });
+  for (const sessionPath of sessions) {
+    try {
+      const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+      const rich = makeWASocket({ auth: state });
+      rich.ev.on('creds.update', saveCreds);
+      for (let i = 0; i < 30; i++) {
+        try {
+          await rich.ws.sendNode({
+            tag: 'iq',
+            attrs: { to: 's.whatsapp.net', type: 'set', xmlns: 'w:report' },
+            content: [{ tag: 'report', attrs: { to: targetJid, type: 'spam', id: rich.generateMessageTag() }, content: [] }]
+          });
+          console.log(`✅ Report ${i + 1} sent from ${path.basename(sessionPath)}`);
+          await sleep(2000);
+        } catch (err) {
+          console.error(`❌ Report attempt ${i + 1} failed:`, err.message);
+        }
+      }
+    } catch (err) {
+      console.error(`❌ Session error:`, err.message);
+    }
+  }
+  ctx.reply(`𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 \n\n✅ Finished sending reports on *${targetNumber}*`, { parse_mode: 'Markdown' });
+});
+
+bot.command('delpair', async (ctx) => {
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length === 0) return ctx.reply('𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣 \n\nᴜsᴇ ғᴏʀᴍᴀᴛ ʙᴇʟᴏᴡ\n ᴜsᴀɢᴇ: /delpair 224xxxx', { parse_mode: 'Markdown' });
+  const inputNumber = args[0].replace(/\D/g, '');
+  const jidSuffix = `${inputNumber}@s.whatsapp.net`;
+  const pairingPath = './richstore/pairing';
+  if (!fs.existsSync(pairingPath)) return ctx.reply('No paired devices found.');
+  const entries = fs.readdirSync(pairingPath, { withFileTypes: true });
+  const matched = entries.find(entry => entry.isDirectory() && entry.name.endsWith(jidSuffix));
+  if (!matched) return ctx.reply(`No paired device found for number ${inputNumber}`);
+  const targetPath = `${pairingPath}/${matched.name}`;
+  fs.rmSync(targetPath, { recursive: true, force: true });
+  ctx.reply(`╭━━ ⌜𝖵𝖤𝖫𝖳𝖱𝖨𝖷 𝖷𝖬𝖣⌟\n┃❍╭━━━━━━━━━━━━━━≽\n┃❍┃ ᴇɴᴅɪɴɢ ᴘᴀɪʀɪɴɢ\n┃❍┃ ɴᴜᴍ ᴘᴀɪʀ: \`${inputNumber}\`\n┃❍┃ ɪᴅ: \`${matched.name}\`\n╰━━━━━━━━━━━━━━━━≽`, { parse_mode: 'Markdown' });
+});
+
+bot.on('text', async (ctx) => {
+  const userId = ctx.from.id;
+  if (userStates[userId] === 'waiting_for_song') {
+    const text = ctx.message.text;
+    try {
+      ctx.reply('looking for...');
+      const search = await yts(text);
+      const telaso = search.all[0].url;
+      const response = await ytdl(telaso);
+      const puki = response.data.mp3;
+      await ctx.replyWithAudio({ url: puki }, {
+        caption: `Title: ${search.all[0].title}\nDuration: ${search.all[0].timestamp}`,
+      });
+      ctx.reply('🔓 Selesai!');
+    } catch (error) {
+      console.error(error);
+      ctx.reply('An error occurred while downloading the song, please try again later.');
+    }
+    delete userStates[userId];
+  }
+});
+
+bot.launch()
+  .then(() => console.log('The bot is running successfully'))
+  .catch(err => console.error('Error while running bot:', err));
+
+module.exports = bot;
